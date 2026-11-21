@@ -14,6 +14,8 @@ type DocumentFields struct {
 	DocumentType   string `json:"document_type"`
 	DocumentNumber string `json:"document_number"`
 	FullName       string `json:"full_name"`
+	FirstName      string `json:"first_name,omitempty"`
+	LastName       string `json:"last_name,omitempty"`
 	Nationality    string `json:"nationality"`
 	Gender         string `json:"gender"`
 	BirthDate      string `json:"birth_date"`
@@ -78,7 +80,27 @@ var boliviaCities = []cityRule{
 	{regexp.MustCompile(`(?i)\b(PANDO|COBIJA)\b`), "Cobija"},
 }
 
-var headerStopwords = regexp.MustCompile(`(?i)\b(ESTADO|PLURINACIONAL|BOLIVIA|SERVICIO|GENERAL|IDENTIFICACI[OÓ]N|PERSONAL|SEGIP|CEDULA|C[EÉ]DULA|IDENTIDAD|REPUBLICA|REP[UÚ]BLICA|REGISTRO|NACIONAL|PERSONAS|RENIEC|DOCUMENTO|CARNET|PASAPORTE|PASSPORT|SERIE|SECCION|SECCI[OÓ]N|FIRMA|TITULAR|DIRECTOR|HUELLA|PULGAR|DERECHO|FOTOGRAF[IÍ]A|VALIDEZ|EMISI[OÓ]N|EXPIRACI[OÓ]N|VENCIMIENTO)\b`)
+// Palabras prohibidas dentro de un nombre o apellido (membretes, etiquetas laterales, estados civiles, extensiones)
+var forbiddenNameTokens = map[string]bool{
+	"ESTADO": true, "PLURINACIONAL": true, "BOLIVIA": true, "SERVICIO": true, "GENERAL": true,
+	"IDENTIFICACION": true, "IDENTIFICACIÓN": true, "PERSONAL": true, "SEGIP": true,
+	"CEDULA": true, "CÉDULA": true, "IDENTIDAD": true, "REPUBLICA": true, "REPÚBLICA": true,
+	"REGISTRO": true, "NACIONAL": true, "PERSONAS": true, "RENIEC": true, "DOCUMENTO": true,
+	"CARNET": true, "PASAPORTE": true, "PASSPORT": true, "SERIE": true, "SECCION": true, "SECCIÓN": true,
+	"FIRMA": true, "TITULAR": true, "DIRECTOR": true, "HUELLA": true, "PULGAR": true, "DERECHO": true,
+	"FOTOGRAFIA": true, "FOTOGRAFÍA": true, "VALIDEZ": true, "EMISION": true, "EMISIÓN": true,
+	"EXPIRACION": true, "EXPIRACIÓN": true, "VENCIMIENTO": true, "FECHA": true, "NACIMIENTO": true,
+	"LUGAR": true, "SEXO": true, "GENERO": true, "GÉNERO": true, "CIVIL": true, "SOLTERO": true,
+	"SOLTERA": true, "CASADO": true, "CASADA": true, "VIUDO": true, "VIUDA": true, "DIVORCIADO": true,
+	"DIVORCIADA": true, "OCUPACION": true, "OCUPACIÓN": true, "PROFESION": true, "PROFESIÓN": true,
+	"DOMICILIO": true, "DIRECCION": true, "DIRECCIÓN": true, "NOMBRE": true, "NOMBRES": true,
+	"APELLIDO": true, "APELLIDOS": true, "PRIMER": true, "SEGUNDO": true, "PATERNO": true, "MATERNO": true,
+	"NRO": true, "NUM": true, "NUMERO": true, "NÚMERO": true, "BOLIVIANA": true, "BOLIVIANO": true,
+	"LP": true, "SC": true, "CB": true, "CBA": true, "OR": true, "PT": true, "TJ": true, "CH": true, "BE": true, "PD": true,
+}
+
+// Cortadores de línea: si en la misma fila horizontal del nombre aparece una etiqueta de otra columna, se corta ahí.
+var reInlineLabelCut = regexp.MustCompile(`(?i)\b(FECHA|FECH|NACIMIENTO|NACIM|LUGAR|SEXO|G[EÉ]NERO|ESTADO\s+CIVIL|EST\.\s*CIVIL|OCUPACI[OÓ]N|PROFESI[OÓ]N|DOMICILIO|SERIE|SECCI[OÓ]N|EXPIRACI[OÓ]N|VENCIMIENTO|EMISI[OÓ]N|FIRMA|HUELLA|N[°ºo.]|C\.?I\.?|NRO)\b.*$`)
 
 // ParseAndMergeSides analiza el texto del frente y del reverso y fusiona los campos extraídos.
 func ParseAndMergeSides(frontText, backText string) ParseResult {
@@ -87,7 +109,7 @@ func ParseAndMergeSides(frontText, backText string) ParseResult {
 		return fRes
 	}
 	bRes := ParseDocumentText(backText)
-	merged := MergeFields(fRes.Fields, bRes.Fields)
+	merged := MergeFieldsWithMRZPriority(fRes.Fields, fRes.DetectedMRZ, bRes.Fields, bRes.DetectedMRZ)
 	detectedMRZ := fRes.DetectedMRZ || bRes.DetectedMRZ
 
 	conf := "PARCIAL"
@@ -130,10 +152,26 @@ func ParseDocumentText(rawText string) ParseResult {
 		docType = "CI"
 	}
 
+	// Si el MRZ detectó el nombre, tiene prioridad absoluta porque está libre de ruido visual del frente
+	finalFirst := visFields.FirstName
+	finalLast := visFields.LastName
+	finalFull := visFields.FullName
+	if mrzDetected && mrzFields.FullName != "" {
+		finalFull = mrzFields.FullName
+		if mrzFields.FirstName != "" {
+			finalFirst = mrzFields.FirstName
+		}
+		if mrzFields.LastName != "" {
+			finalLast = mrzFields.LastName
+		}
+	}
+
 	fields := DocumentFields{
 		DocumentType:   docType,
 		DocumentNumber: mergeDocNumber(mrzFields.DocumentNumber, visFields.DocumentNumber),
-		FullName:       chooseBestName(mrzFields.FullName, visFields.FullName),
+		FullName:       finalFull,
+		FirstName:      finalFirst,
+		LastName:       finalLast,
 		Nationality:    firstNonEmpty(mrzFields.Nationality, visFields.Nationality),
 		Gender:         firstNonEmpty(mrzFields.Gender, visFields.Gender),
 		BirthDate:      firstNonEmpty(mrzFields.BirthDate, visFields.BirthDate),
@@ -157,8 +195,8 @@ func ParseDocumentText(rawText string) ParseResult {
 	}
 }
 
-// MergeFields fusiona dos estructuras DocumentFields sin sobrescribir valores válidos con vacíos.
-func MergeFields(current, incoming DocumentFields) DocumentFields {
+// MergeFieldsWithMRZPriority fusiona Frente y Reverso, combinando Nombres + Apellidos si fueron leídos por separado y priorizando MRZ.
+func MergeFieldsWithMRZPriority(current DocumentFields, curMRZ bool, incoming DocumentFields, incMRZ bool) DocumentFields {
 	out := current
 	if incoming.DocumentType != "" && (out.DocumentType == "" || out.DocumentType == "CI") {
 		out.DocumentType = incoming.DocumentType
@@ -166,9 +204,28 @@ func MergeFields(current, incoming DocumentFields) DocumentFields {
 	if incoming.DocumentNumber != "" {
 		out.DocumentNumber = mergeDocNumber(out.DocumentNumber, incoming.DocumentNumber)
 	}
-	if incoming.FullName != "" {
-		out.FullName = chooseBestName(out.FullName, incoming.FullName)
+
+	// Combinar FirstName y LastName de ambas lecturas
+	if incMRZ && incoming.FullName != "" {
+		out.FullName = incoming.FullName
+		out.FirstName = firstNonEmpty(incoming.FirstName, out.FirstName)
+		out.LastName = firstNonEmpty(incoming.LastName, out.LastName)
+	} else if !curMRZ {
+		if out.FirstName == "" && incoming.FirstName != "" {
+			out.FirstName = incoming.FirstName
+		}
+		if out.LastName == "" && incoming.LastName != "" {
+			out.LastName = incoming.LastName
+		}
+		if out.FirstName != "" && out.LastName != "" {
+			out.FullName = strings.TrimSpace(out.FirstName + " " + out.LastName)
+		} else if incoming.FullName != "" && out.FullName == "" {
+			out.FullName = incoming.FullName
+		} else if incoming.FullName != "" && len(strings.Fields(incoming.FullName)) > len(strings.Fields(out.FullName)) && len(strings.Fields(incoming.FullName)) <= 4 {
+			out.FullName = incoming.FullName
+		}
 	}
+
 	if out.Nationality == "" && incoming.Nationality != "" {
 		out.Nationality = incoming.Nationality
 	}
@@ -185,6 +242,11 @@ func MergeFields(current, incoming DocumentFields) DocumentFields {
 		out.OriginCity = incoming.OriginCity
 	}
 	return out
+}
+
+// MergeFields mantiene compatibilidad con llamadas directas sin banderas MRZ.
+func MergeFields(current, incoming DocumentFields) DocumentFields {
+	return MergeFieldsWithMRZPriority(current, false, incoming, false)
 }
 
 func countNonEmpty(f DocumentFields) int {
@@ -235,20 +297,6 @@ func mergeDocNumber(a, b string) string {
 	return a
 }
 
-func chooseBestName(a, b string) string {
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	aWords := len(strings.Fields(a))
-	bWords := len(strings.Fields(b))
-	if aWords >= 2 && aWords >= bWords {
-		return a
-	}
-	if bWords >= 2 {
-		return b
-	}
-	return firstNonEmpty(a, b)
-}
-
 var (
 	reMRZPrefix = regexp.MustCompile(`^(ID|I<|P<|A<|C<)[A-Z]{3}`)
 	reTD1Line1  = regexp.MustCompile(`^(I[D<A-Z0-9]|A[C<A-Z0-9]|C[I<A-Z0-9])([A-Z]{3})([A-Z0-9<]{7,25})`)
@@ -296,8 +344,11 @@ func parseMRZFromLines(lines []string) (DocumentFields, bool) {
 			if nat, ok := countryCodeMap[countryCode]; ok {
 				res.Nationality = nat
 			}
-			if name := parseMRZNameBlock(m[2]); name != "" {
-				res.FullName = name
+			first, last, full := parseMRZNameParts(m[2])
+			if full != "" {
+				res.FirstName = first
+				res.LastName = last
+				res.FullName = full
 			}
 		}
 
@@ -324,9 +375,12 @@ func parseMRZFromLines(lines []string) (DocumentFields, bool) {
 			!strings.HasPrefix(l, "I<") &&
 			!strings.HasPrefix(l, "P<") &&
 			!reHas4Digit.MatchString(prefix10) {
-			if name := parseMRZNameBlock(l); len(name) >= 5 {
+			first, last, full := parseMRZNameParts(l)
+			if len(full) >= 5 {
 				detected = true
-				res.FullName = name
+				res.FirstName = first
+				res.LastName = last
+				res.FullName = full
 			}
 		}
 	}
@@ -377,7 +431,7 @@ func parseMRZDate(yymmdd string) string {
 	return fmt.Sprintf("%04d-%02d-%02d", year, mm, dd)
 }
 
-func parseMRZNameBlock(mrzLine string) string {
+func parseMRZNameParts(mrzLine string) (firstName, lastName, fullName string) {
 	fixed := fixMRZLetters(mrzLine)
 	var b strings.Builder
 	for _, r := range fixed {
@@ -387,18 +441,18 @@ func parseMRZNameBlock(mrzLine string) string {
 	}
 	parts := strings.Split(b.String(), "<<")
 	if len(parts) < 2 {
-		return ""
+		return "", "", ""
 	}
-	surnames := strings.Join(strings.Fields(strings.ReplaceAll(parts[0], "<", " ")), " ")
-	given := strings.Join(strings.Fields(strings.ReplaceAll(strings.Join(parts[1:], " "), "<", " ")), " ")
+	surnames := toTitleCase(strings.Join(strings.Fields(strings.ReplaceAll(parts[0], "<", " ")), " "))
+	given := toTitleCase(strings.Join(strings.Fields(strings.ReplaceAll(strings.Join(parts[1:], " "), "<", " ")), " "))
 	if surnames == "" && given == "" {
-		return ""
+		return "", "", ""
 	}
 	full := surnames
 	if given != "" {
 		full = strings.TrimSpace(given + " " + surnames)
 	}
-	return toTitleCase(full)
+	return given, surnames, full
 }
 
 var (
@@ -418,14 +472,16 @@ var (
 	reNacDate  = regexp.MustCompile(`(?i)NACIMIENTO[\s\S]{0,45}?\b(\d{1,2})[/.-](\d{1,2})[/.-]((19|20)\d{2})\b`)
 	reAnyDate  = regexp.MustCompile(`\b(\d{1,2})[/.-](\d{1,2})[/.-]((19\d{2}|20[012]\d))\b`)
 
-	reNombres   = regexp.MustCompile(`(?i)\bNOMBRES?\s*[:.]?\s*(.*)$`)
-	reApellido1 = regexp.MustCompile(`(?i)\b(?:PRIMER\s+APELLIDO|APELLIDO\s+PATERNO)\s*[:.]?\s*(.*)$`)
-	reApellido2 = regexp.MustCompile(`(?i)\b(?:SEGUNDO\s+APELLIDO|APELLIDO\s+MATERNO)\s*[:.]?\s*(.*)$`)
-	reApellidos = regexp.MustCompile(`(?i)^\s*APELLIDOS?\s*[:.]?\s*(.*)$`)
-	reClassicA  = regexp.MustCompile(`(?i)^\s*A\s*[:.]\s*([A-ZÁÉÍÓÚÑ\s]{5,45})$`)
-	reOcupacion = regexp.MustCompile(`(?i)\b(?:OCUPACI[OÓ]N|PROFESI[OÓ]N)(?:\s*[/]\s*(?:PROFESI[OÓ]N|OCUPACI[OÓ]N))?\s*[:.]?\s*(.*)$`)
-	reOrigen    = regexp.MustCompile(`(?i)\b(?:LUGAR\s+DE\s+NACIMIENTO|NATURAL\s+DE|NACIDO\s+EN|DEPARTAMENTO)\s*[:.]?\s*(.*)$`)
-	reSexo      = regexp.MustCompile(`(?i)\b(?:SEXO|G[EÉ]NERO)\s*[:.]?\s*(MASCULINO|FEMENINO|HOMBRE|MUJER|\bM\b|\bF\b)`)
+	// Etiquetas tolerantes a errores comunes de OCR (0 por O, 1 por I) y sin ancla ^ rígida
+	reBothApellidoHeaders = regexp.MustCompile(`(?i)PR[I1]MER\s+APELL[I1]D[O0].*SEGUND[O0]\s+APELL[I1]D[O0]|APELL[I1]D[O0]\s+PATERN[O0].*APELL[I1]D[O0]\s+MATERN[O0]`)
+	reNombres             = regexp.MustCompile(`(?i)\bN[O0]MBRES?\s*[:.;-]?\s*(.*)$`)
+	reApellido1           = regexp.MustCompile(`(?i)\b(?:PR[I1]MER\s+APELL[I1]D[O0]|APELL[I1]D[O0]\s+PATERN[O0])\s*[:.;-]?\s*(.*)$`)
+	reApellido2           = regexp.MustCompile(`(?i)\b(?:SEGUND[O0]\s+APELL[I1]D[O0]|APELL[I1]D[O0]\s+MATERN[O0])\s*[:.;-]?\s*(.*)$`)
+	reApellidos           = regexp.MustCompile(`(?i)\bAPELL[I1]D[O0]S?\s*[:.;-]?\s*(.*)$`)
+	reClassicA            = regexp.MustCompile(`(?i)\bA\s*[:.]\s*([A-ZÁÉÍÓÚÑ\s]{5,45})$`)
+	reOcupacion           = regexp.MustCompile(`(?i)\b(?:[O0]CUPAC[I1][OÓ0]N|PR[O0]FES[I1][OÓ0]N)(?:\s*[/]\s*(?:PR[O0]FES[I1][OÓ0]N|[O0]CUPAC[I1][OÓ0]N))?\s*[:.;-]?\s*(.*)$`)
+	reOrigen              = regexp.MustCompile(`(?i)\b(?:LUGAR\s+DE\s+NAC[I1]M[I1]ENT[O0]|NATURAL\s+DE|NAC[I1]D[O0]\s+EN|DEPARTAMENT[O0])\s*[:.;-]?\s*(.*)$`)
+	reSexo                = regexp.MustCompile(`(?i)\b(?:SEX[O0]|G[EÉ]NER[O0])\s*[:.;-]?\s*(MASCULINO|FEMENINO|HOMBRE|MUJER|\bM\b|\bF\b)`)
 )
 
 func parseVisualLabels(lines []string, fullText string) DocumentFields {
@@ -484,6 +540,8 @@ func parseVisualLabels(lines []string, fullText string) DocumentFields {
 	}
 
 	var givenNames, surnames, firstSurname, secondSurname, singleLineName string
+	givenLineIdx := -1
+	surnameLineIdx := -1
 
 	for i, line := range lines {
 		nextLine := ""
@@ -491,41 +549,75 @@ func parseVisualLabels(lines []string, fullText string) DocumentFields {
 			nextLine = lines[i+1]
 		}
 
+		// Caso 1: La línea tiene los dos encabezados en columnas: "PRIMER APELLIDO   SEGUNDO APELLIDO"
+		if reBothApellidoHeaders.MatchString(line) && surnames == "" {
+			surnames = sanitizePersonTokens(nextLine, 3)
+			if surnames != "" {
+				surnameLineIdx = i + 1
+			}
+			continue
+		}
+
+		// Caso 2: NOMBRES
 		if m := reNombres.FindStringSubmatch(line); m != nil && givenNames == "" {
-			inline := cleanPersonName(m[1])
+			inline := sanitizePersonTokens(m[1], 3)
 			if len(inline) >= 2 {
 				givenNames = inline
+				givenLineIdx = i
 			} else {
-				givenNames = cleanPersonName(nextLine)
+				givenNames = sanitizePersonTokens(nextLine, 3)
+				if givenNames != "" {
+					givenLineIdx = i + 1
+				}
 			}
 		}
+
+		// Caso 3: PRIMER APELLIDO
 		if m := reApellido1.FindStringSubmatch(line); m != nil && firstSurname == "" {
-			inline := cleanPersonName(m[1])
+			inline := sanitizePersonTokens(m[1], 2)
 			if len(inline) >= 2 {
 				firstSurname = inline
+				surnameLineIdx = i
 			} else {
-				firstSurname = cleanPersonName(nextLine)
+				firstSurname = sanitizePersonTokens(nextLine, 2)
+				if firstSurname != "" {
+					surnameLineIdx = i + 1
+				}
 			}
 		}
+
+		// Caso 4: SEGUNDO APELLIDO
 		if m := reApellido2.FindStringSubmatch(line); m != nil && secondSurname == "" {
-			inline := cleanPersonName(m[1])
+			inline := sanitizePersonTokens(m[1], 2)
 			if len(inline) >= 2 {
 				secondSurname = inline
 			} else {
-				secondSurname = cleanPersonName(nextLine)
+				secondSurname = sanitizePersonTokens(nextLine, 2)
 			}
 		}
-		if m := reApellidos.FindStringSubmatch(line); m != nil && surnames == "" {
-			inline := cleanPersonName(m[1])
-			if len(inline) >= 2 {
-				surnames = inline
-			} else {
-				surnames = cleanPersonName(nextLine)
+
+		// Caso 5: APELLIDOS (sin ser PRIMER/SEGUNDO)
+		if !reApellido1.MatchString(line) && !reApellido2.MatchString(line) {
+			if m := reApellidos.FindStringSubmatch(line); m != nil && surnames == "" {
+				inline := sanitizePersonTokens(m[1], 3)
+				if len(inline) >= 2 {
+					surnames = inline
+					surnameLineIdx = i
+				} else {
+					surnames = sanitizePersonTokens(nextLine, 3)
+					if surnames != "" {
+						surnameLineIdx = i + 1
+					}
+				}
 			}
 		}
+
+		// Caso 6: Carnet clásico "A: ALEJANDRO TORREZ SILVA"
 		if m := reClassicA.FindStringSubmatch(line); m != nil && singleLineName == "" {
-			singleLineName = cleanPersonName(m[1])
+			singleLineName = sanitizePersonTokens(m[1], 4)
 		}
+
+		// OCUPACIÓN / PROFESIÓN
 		if m := reOcupacion.FindStringSubmatch(line); m != nil && out.Occupation == "" {
 			inline := cleanLabelValue(m[1])
 			if len(inline) >= 3 {
@@ -534,6 +626,8 @@ func parseVisualLabels(lines []string, fullText string) DocumentFields {
 				out.Occupation = cleanLabelValue(nextLine)
 			}
 		}
+
+		// LUGAR DE NACIMIENTO / PROCEDENCIA
 		if m := reOrigen.FindStringSubmatch(line); m != nil && out.OriginCity == "" {
 			candidate := m[1] + " " + nextLine
 			city := detectBoliviaCity(candidate)
@@ -543,6 +637,8 @@ func parseVisualLabels(lines []string, fullText string) DocumentFields {
 				out.OriginCity = cleanLabelValue(m[1])
 			}
 		}
+
+		// SEXO / GÉNERO
 		if m := reSexo.FindStringSubmatch(line); m != nil && out.Gender == "" {
 			v := strings.ToUpper(m[1])
 			if strings.HasPrefix(v, "F") || strings.HasPrefix(v, "MUJ") {
@@ -558,12 +654,48 @@ func parseVisualLabels(lines []string, fullText string) DocumentFields {
 		combinedSurnames = surnames
 	}
 
-	if givenNames != "" && combinedSurnames != "" {
-		out.FullName = toTitleCase(givenNames + " " + combinedSurnames)
+	// Respaldo posicional: si el OCR leyó "NOMBRES: MIJAEL" pero la etiqueta "APELLIDOS" salió ilegible,
+	// revisar la línea inmediatamente siguiente o anterior al nombre por si contiene los apellidos limpios.
+	if givenNames != "" && combinedSurnames == "" && givenLineIdx >= 0 {
+		for _, candidateIdx := range []int{givenLineIdx + 1, givenLineIdx + 2, givenLineIdx - 1} {
+			if candidateIdx >= 0 && candidateIdx < len(lines) && candidateIdx != givenLineIdx {
+				rawCand := lines[candidateIdx]
+				if !strings.Contains(rawCand, ":") && !reAnyDate.MatchString(rawCand) && !reDoc3.MatchString(rawCand) {
+					candTokens := sanitizePersonTokens(rawCand, 3)
+					if candTokens != "" && !strings.EqualFold(candTokens, givenNames) && len(strings.Fields(candTokens)) >= 1 && len(strings.Fields(candTokens)) <= 3 {
+						combinedSurnames = candTokens
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Y viceversa: si detectó los apellidos pero la etiqueta "NOMBRES" salió borrosa
+	if combinedSurnames != "" && givenNames == "" && surnameLineIdx > 0 {
+		for _, candidateIdx := range []int{surnameLineIdx - 1, surnameLineIdx + 1} {
+			if candidateIdx >= 0 && candidateIdx < len(lines) && candidateIdx != surnameLineIdx {
+				rawCand := lines[candidateIdx]
+				if !strings.Contains(rawCand, ":") && !reAnyDate.MatchString(rawCand) && !reDoc3.MatchString(rawCand) {
+					candTokens := sanitizePersonTokens(rawCand, 2)
+					if candTokens != "" && !strings.EqualFold(candTokens, combinedSurnames) {
+						givenNames = candTokens
+						break
+					}
+				}
+			}
+		}
+	}
+
+	out.FirstName = toTitleCase(givenNames)
+	out.LastName = toTitleCase(combinedSurnames)
+
+	if out.FirstName != "" && out.LastName != "" {
+		out.FullName = strings.TrimSpace(out.FirstName + " " + out.LastName)
 	} else if singleLineName != "" {
 		out.FullName = toTitleCase(singleLineName)
-	} else if givenNames != "" || combinedSurnames != "" {
-		out.FullName = toTitleCase(strings.TrimSpace(givenNames + " " + combinedSurnames))
+	} else if out.FirstName != "" || out.LastName != "" {
+		out.FullName = strings.TrimSpace(out.FirstName + " " + out.LastName)
 	}
 
 	if out.OriginCity == "" {
@@ -576,37 +708,112 @@ func parseVisualLabels(lines []string, fullText string) DocumentFields {
 	return out
 }
 
-func cleanPersonName(raw string) string {
+// sanitizePersonTokens limpia una línea de nombre o apellido:
+// 1. Corta la línea si aparece una etiqueta de otra columna (FECHA, NACIMIENTO, SEXO, ESTADO CIVIL, etc.).
+// 2. Descarta tokens de 1 sola letra (excepto "Y" / "DE" / "DEL" / "LA"), palabras sin vocales (ruido del escudo/fondo),
+//    siglas de departamentos (LP, SC, CB) y palabras de membrete.
+// 3. Limita la cantidad máxima de palabras (maxWords) para no arrastrar basura del final de la línea.
+func sanitizePersonTokens(raw string, maxWords int) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	if maxWords <= 0 {
+		maxWords = 3
+	}
+
+	// 1. Cortar en cuanto aparezca una etiqueta intrusa en la misma línea horizontal
+	cut := reInlineLabelCut.ReplaceAllString(raw, "")
+
+	// 2. Dejar solo letras y espacios
 	var b strings.Builder
-	for _, r := range raw {
+	for _, r := range cut {
 		if unicode.IsLetter(r) || unicode.IsSpace(r) {
 			b.WriteRune(r)
 		} else {
 			b.WriteRune(' ')
 		}
 	}
-	cleaned := strings.Join(strings.Fields(b.String()), " ")
-	if len(cleaned) < 2 || headerStopwords.MatchString(cleaned) {
-		return ""
+
+	words := strings.Fields(b.String())
+	var valid []string
+	connectors := map[string]bool{"DE": true, "DEL": true, "LA": true, "LAS": true, "LOS": true}
+
+	for _, w := range words {
+		up := strings.ToUpper(w)
+		if forbiddenNameTokens[up] {
+			continue
+		}
+		if connectors[up] {
+			if len(valid) > 0 {
+				valid = append(valid, up)
+			}
+			continue
+		}
+		if len([]rune(up)) < 2 || len([]rune(up)) > 18 {
+			continue
+		}
+		if !hasSpanishVowel(up) || hasTripleRepeat(up) {
+			continue
+		}
+		valid = append(valid, up)
+		if len(valid) >= maxWords {
+			break
+		}
 	}
-	return cleaned
+
+	// Si el último token quedó siendo un conector suelto ("DE"), quitarlo
+	for len(valid) > 0 && connectors[valid[len(valid)-1]] {
+		valid = valid[:len(valid)-1]
+	}
+
+	return strings.Join(valid, " ")
+}
+
+func hasSpanishVowel(s string) bool {
+	for _, r := range s {
+		switch unicode.ToUpper(r) {
+		case 'A', 'E', 'I', 'O', 'U', 'Á', 'É', 'Í', 'Ó', 'Ú', 'Ü':
+			return true
+		}
+	}
+	return false
+}
+
+func hasTripleRepeat(s string) bool {
+	runes := []rune(s)
+	for i := 2; i < len(runes); i++ {
+		if runes[i] == runes[i-1] && runes[i] == runes[i-2] {
+			return true
+		}
+	}
+	return false
 }
 
 func cleanLabelValue(raw string) string {
+	cut := reInlineLabelCut.ReplaceAllString(raw, "")
 	var b strings.Builder
-	for _, r := range raw {
+	for _, r := range cut {
 		if unicode.IsLetter(r) || unicode.IsSpace(r) || r == '.' || r == '-' {
 			b.WriteRune(r)
 		} else {
 			b.WriteRune(' ')
 		}
 	}
-	cleaned := strings.Join(strings.Fields(b.String()), " ")
-	if len(cleaned) < 3 || headerStopwords.MatchString(cleaned) {
-		return ""
+	words := strings.Fields(b.String())
+	var valid []string
+	for _, w := range words {
+		up := strings.ToUpper(w)
+		if forbiddenNameTokens[up] || len([]rune(up)) < 2 || !hasSpanishVowel(up) {
+			continue
+		}
+		valid = append(valid, w)
+		if len(valid) >= 4 {
+			break
+		}
 	}
-	if len(cleaned) > 40 {
-		cleaned = cleaned[:40]
+	cleaned := strings.Join(valid, " ")
+	if len(cleaned) < 3 {
+		return ""
 	}
 	return toTitleCase(cleaned)
 }

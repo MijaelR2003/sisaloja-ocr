@@ -82,3 +82,42 @@ func TestOCRMicroservice_BoliviaFrontAndBackMRZ(t *testing.T) {
 		t.Fatalf("expected OriginCity='La Paz', got '%s'", res.Fields.OriginCity)
 	}
 }
+
+func TestOCRMicroservice_NoisyColumnsAndSplitLastNames(t *testing.T) {
+	app := NewApp()
+
+	payload := map[string]string{
+		"front_text": `
+			ESTADO PLURINACIONAL DE BOLIVIA
+			SERVICIO GENERAL DE IDENTIFICACION PERSONAL
+			CEDULA DE IDENTIDAD N° 9412833 CB
+			NOMBRES: MIJAEL   FECHA DE NACIMIENTO 20/11/2003   SEXO M
+			PRIMER APELLIDO   SEGUNDO APELLIDO
+			RODRIGUEZ   VARGAS   ESTADO CIVIL SOLTERO
+		`,
+	}
+	body, _ := json.Marshal(payload)
+	reqScan := httptest.NewRequest(http.MethodPost, "/api/v1/ocr/scan", bytes.NewReader(body))
+	reqScan.Header.Set("Content-Type", "application/json")
+
+	respScan, err := app.Test(reqScan)
+	if err != nil || respScan.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on /api/v1/ocr/scan, got %v", respScan.StatusCode)
+	}
+
+	var res parser.ParseResult
+	if err := json.NewDecoder(respScan.Body).Decode(&res); err != nil {
+		t.Fatalf("failed to decode scan response: %v", err)
+	}
+
+	if res.Fields.FirstName != "Mijael" {
+		t.Fatalf("expected FirstName='Mijael', got '%s'", res.Fields.FirstName)
+	}
+	if res.Fields.LastName != "Rodriguez Vargas" {
+		t.Fatalf("expected LastName='Rodriguez Vargas', got '%s'", res.Fields.LastName)
+	}
+	if res.Fields.FullName != "Mijael Rodriguez Vargas" {
+		t.Fatalf("expected FullName='Mijael Rodriguez Vargas', got '%s'", res.Fields.FullName)
+	}
+}
+
