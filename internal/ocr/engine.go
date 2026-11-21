@@ -17,6 +17,59 @@ import (
 	"github.com/MijaelR2003/sisaloja-ocr/internal/parser"
 )
 
+// findVisionBinary localiza el binario nativo vision-ocr (Apple Vision Neural Engine en macOS).
+func findVisionBinary() string {
+	candidates := []string{"./vision-ocr"}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), "vision-ocr"))
+	}
+	if p, err := exec.LookPath("vision-ocr"); err == nil {
+		candidates = append(candidates, p)
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+// HasVisionOCR indica si el motor neuronal Apple Vision está disponible en el servidor.
+func HasVisionOCR() bool {
+	return findVisionBinary() != ""
+}
+
+// ExtractTextWithVisionOCR ejecuta el motor neuronal Apple Vision sobre bytes de imagen.
+func ExtractTextWithVisionOCR(imgBytes []byte) (string, error) {
+	if len(imgBytes) == 0 {
+		return "", nil
+	}
+	bin := findVisionBinary()
+	if bin == "" {
+		return "", errors.New("vision-ocr no disponible")
+	}
+	tmpFile, err := os.CreateTemp("", "sisaloja-vision-*.jpg")
+	if err != nil {
+		return "", err
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmpFile.Write(imgBytes); err != nil {
+		tmpFile.Close()
+		return "", err
+	}
+	tmpFile.Close()
+
+	cmd := exec.Command(bin, tmpPath)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out.String()), nil
+}
+
 // HasTesseractCLI comprueba si el binario tesseract está disponible en el sistema operativo o contenedor.
 func HasTesseractCLI() bool {
 	_, err := exec.LookPath("tesseract")

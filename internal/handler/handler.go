@@ -40,10 +40,11 @@ func (h *OCRHandler) Health(c *fiber.Ctx) error {
 		"service": "sisaloja-ocr",
 		"port":    8090,
 		"engines": fiber.Map{
-			"mrz_icao9303":   true,
-			"segip_bolivia":  true,
-			"tesseract_cli":  ocr.HasTesseractCLI(),
-			"gemini_vision":  h.GeminiAPIKey != "",
+			"mrz_icao9303":        true,
+			"segip_bolivia":       true,
+			"apple_vision_neural": ocr.HasVisionOCR(),
+			"tesseract_cli":       ocr.HasTesseractCLI(),
+			"gemini_vision":       h.GeminiAPIKey != "",
 		},
 	})
 }
@@ -116,20 +117,52 @@ func (h *OCRHandler) ScanDocument(c *fiber.Ctx) error {
 		}
 	}
 
-	// 1. Si llegaron bytes de imagen y el servidor tiene Tesseract CLI instalado, extraer texto en el servidor
-	if len(frontBytes) > 0 && ocr.HasTesseractCLI() {
-		if txt, err := ocr.ExtractTextWithTesseractCLI(frontBytes, h.TesseractLang); err == nil && strings.TrimSpace(txt) != "" {
-			frontText = frontText + "\n" + txt
+	// 1. Si llegaron bytes de imagen y el servidor tiene Apple Vision Neural OCR (macOS) o Tesseract CLI,
+	// extraer el texto de alta precisión directamente en el servidor.
+	var visionFront, visionBack string
+	usedVision := false
+	if len(frontBytes) > 0 && ocr.HasVisionOCR() {
+		if txt, err := ocr.ExtractTextWithVisionOCR(frontBytes); err == nil && strings.TrimSpace(txt) != "" {
+			visionFront = txt
+			usedVision = true
 		}
-	}
-	if len(backBytes) > 0 && ocr.HasTesseractCLI() {
-		if txt, err := ocr.ExtractTextWithTesseractCLI(backBytes, h.TesseractLang); err == nil && strings.TrimSpace(txt) != "" {
-			backText = backText + "\n" + txt
+	} else if len(frontBytes) > 0 && ocr.HasTesseractCLI() {
+		if txt, err := ocr.ExtractTextWithTesseractCLI(frontBytes, h.TesseractLang); err == nil && strings.TrimSpace(txt) != "" {
+			frontText = txt + "\n" + frontText
 		}
 	}
 
-	// 2. Ejecutar el decodificador MRZ ICAO 9303 + Analizador SEGIP Bolivia / DNI / Pasaporte
-	res := parser.ParseAndMergeSides(frontText, backText)
+	if len(backBytes) > 0 && ocr.HasVisionOCR() {
+		if txt, err := ocr.ExtractTextWithVisionOCR(backBytes); err == nil && strings.TrimSpace(txt) != "" {
+			visionBack = txt
+			usedVision = true
+		}
+	} else if len(backBytes) > 0 && ocr.HasTesseractCLI() {
+		if txt, err := ocr.ExtractTextWithTesseractCLI(backBytes, h.TesseractLang); err == nil && strings.TrimSpace(txt) != "" {
+			backText = txt + "\n" + backText
+		}
+	}
+
+	// 2. Ejecutar el decodificador MRZ ICAO 9303 + Motor Especializado SEGIP Bolivia
+	var res parser.ParseResult
+	if usedVision {
+		// Analizar primero el texto limpio del motor neuronal Apple Vision sin ruido de Tesseract
+		res = parser.ParseAndMergeSides(visionFront, visionBack)
+		res.Engine = "apple-vision-neural+segip-bolivia"
+		res.RawText = strings.TrimSpace(visionFront + "\n" + visionBack)
+
+		// Si el navegador también envió texto adicional (ej. de un recorte ROI), completar solo campos que falten
+		if strings.TrimSpace(frontText) != "" || strings.TrimSpace(backText) != "" {
+			fallbackRes := parser.ParseAndMergeSides(frontText, backText)
+			res.Fields = parser.MergeFieldsWithMRZPriority(res.Fields, res.DetectedMRZ, fallbackRes.Fields, fallbackRes.DetectedMRZ)
+			if fallbackRes.DetectedMRZ {
+				res.DetectedMRZ = true
+			}
+		}
+	} else {
+		res = parser.ParseAndMergeSides(frontText, backText)
+		res.RawText = strings.TrimSpace(frontText + "\n" + backText)
+	}
 
 	// 3. Si hay GEMINI_API_KEY opcional configurada y llegaron imágenes, enriquecer campos vacíos
 	if h.GeminiAPIKey != "" && (len(frontBytes) > 0 || len(backBytes) > 0) {

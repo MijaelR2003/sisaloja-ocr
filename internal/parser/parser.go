@@ -25,11 +25,15 @@ type DocumentFields struct {
 
 // ParseResult representa el resultado de analizar el texto de una o ambas caras de un documento.
 type ParseResult struct {
-	Service     string         `json:"service"`
-	Engine      string         `json:"engine"`
-	Confidence  string         `json:"confidence"`
-	DetectedMRZ bool           `json:"detected_mrz"`
-	Fields      DocumentFields `json:"fields"`
+	Service          string         `json:"service"`
+	Engine           string         `json:"engine"`
+	Confidence       string         `json:"confidence"`
+	DetectedMRZ      bool           `json:"detected_mrz"`
+	IsBolivia        bool           `json:"is_bolivia,omitempty"`
+	BoliviaSubtype   string         `json:"bolivia_subtype,omitempty"`
+	ExtractionMethod string         `json:"extraction_method,omitempty"`
+	RawText          string         `json:"raw_text,omitempty"`
+	Fields           DocumentFields `json:"fields"`
 }
 
 var countryCodeMap = map[string]string{
@@ -112,20 +116,39 @@ func ParseAndMergeSides(frontText, backText string) ParseResult {
 	merged := MergeFieldsWithMRZPriority(fRes.Fields, fRes.DetectedMRZ, bRes.Fields, bRes.DetectedMRZ)
 	detectedMRZ := fRes.DetectedMRZ || bRes.DetectedMRZ
 
+	// Si alguna de las caras no tenía el nombre completo pero al unir frente + reverso se complementan
+	if merged.FullName == "" {
+		cRes := ParseDocumentText(frontText + "\n" + backText)
+		if cRes.Fields.FullName != "" {
+			merged.FirstName = firstNonEmpty(merged.FirstName, cRes.Fields.FirstName)
+			merged.LastName = firstNonEmpty(merged.LastName, cRes.Fields.LastName)
+			merged.FullName = cRes.Fields.FullName
+		}
+	}
+
+	if merged.Gender == "" && merged.FirstName != "" {
+		merged.Gender = InferGenderFromBoliviaFirstName(merged.FirstName)
+	}
+
 	conf := "PARCIAL"
 	count := countNonEmpty(merged)
 	if detectedMRZ {
 		conf = "ALTA (MRZ Verificado)"
+	} else if (fRes.IsBolivia || bRes.IsBolivia) && merged.FullName != "" && merged.DocumentNumber != "" {
+		conf = "ALTA (SEGIP Bolivia Verificado)"
 	} else if count >= 3 {
 		conf = "MEDIA-ALTA"
 	}
 
 	return ParseResult{
-		Service:     "sisaloja-ocr",
-		Engine:      "hybrid-mrz-segip",
-		Confidence:  conf,
-		DetectedMRZ: detectedMRZ,
-		Fields:      merged,
+		Service:          "sisaloja-ocr",
+		Engine:           "hybrid-mrz-segip-bolivia",
+		Confidence:       conf,
+		DetectedMRZ:      detectedMRZ,
+		IsBolivia:        fRes.IsBolivia || bRes.IsBolivia,
+		BoliviaSubtype:   firstNonEmpty(bRes.BoliviaSubtype, fRes.BoliviaSubtype),
+		ExtractionMethod: firstNonEmpty(bRes.ExtractionMethod, fRes.ExtractionMethod),
+		Fields:           merged,
 	}
 }
 
@@ -143,20 +166,45 @@ func ParseDocumentText(rawText string) ParseResult {
 
 	mrzFields, mrzDetected := parseMRZFromLines(lines)
 	visFields := parseVisualLabels(lines, text)
+	bolAnalysis := IdentifyAndParseBoliviaDocument(lines, text)
+
+	if bolAnalysis.ExtractionMethod == "MRZ_IDBOL" {
+		mrzDetected = true
+	}
 
 	docType := mrzFields.DocumentType
 	if docType == "" {
 		docType = visFields.DocumentType
 	}
+	if docType == "" && bolAnalysis.IsBolivia {
+		docType = bolAnalysis.Fields.DocumentType
+	}
 	if docType == "" {
 		docType = "CI"
 	}
 
-	// Si el MRZ detectó el nombre, tiene prioridad absoluta porque está libre de ruido visual del frente
+	// Prioridad de Nombre Completo:
+	// 1. MRZ verificado (ICAO 9303 o IDBOL)
+	// 2. Motor especializado SEGIP Bolivia (etiquetas, titular clásico o ventana estructural)
+	// 3. Etiquetas visuales generales
 	finalFirst := visFields.FirstName
 	finalLast := visFields.LastName
 	finalFull := visFields.FullName
-	if mrzDetected && mrzFields.FullName != "" {
+
+	if bolAnalysis.IsBolivia && bolAnalysis.Fields.FullName != "" {
+		// Si el parser general no encontró nombre, o encontró menos palabras que el motor especializado de Bolivia
+		if finalFull == "" || len(strings.Fields(bolAnalysis.Fields.FullName)) > len(strings.Fields(finalFull)) {
+			finalFull = bolAnalysis.Fields.FullName
+			finalFirst = firstNonEmpty(bolAnalysis.Fields.FirstName, finalFirst)
+			finalLast = firstNonEmpty(bolAnalysis.Fields.LastName, finalLast)
+		}
+	}
+
+	if bolAnalysis.ExtractionMethod == "MRZ_IDBOL" && bolAnalysis.Fields.FullName != "" {
+		finalFull = bolAnalysis.Fields.FullName
+		finalFirst = firstNonEmpty(bolAnalysis.Fields.FirstName, finalFirst)
+		finalLast = firstNonEmpty(bolAnalysis.Fields.LastName, finalLast)
+	} else if mrzDetected && mrzFields.FullName != "" {
 		finalFull = mrzFields.FullName
 		if mrzFields.FirstName != "" {
 			finalFirst = mrzFields.FirstName
@@ -166,15 +214,38 @@ func ParseDocumentText(rawText string) ParseResult {
 		}
 	}
 
+	docNum := mergeDocNumber(mrzFields.DocumentNumber, visFields.DocumentNumber)
+	if bolAnalysis.IsBolivia && bolAnalysis.Fields.DocumentNumber != "" {
+		docNum = mergeDocNumber(docNum, bolAnalysis.Fields.DocumentNumber)
+	}
+
+	nationality := firstNonEmpty(mrzFields.Nationality, visFields.Nationality)
+	if nationality == "" && bolAnalysis.IsBolivia && (docNum != "" || finalFull != "") {
+		nationality = "Boliviana"
+	}
+
+	gender := firstNonEmpty(mrzFields.Gender, visFields.Gender)
+	if gender == "" && bolAnalysis.Fields.Gender != "" {
+		gender = bolAnalysis.Fields.Gender
+	}
+	if gender == "" && finalFirst != "" {
+		gender = InferGenderFromBoliviaFirstName(finalFirst)
+	}
+
+	birthDate := firstNonEmpty(mrzFields.BirthDate, visFields.BirthDate)
+	if birthDate == "" && bolAnalysis.Fields.BirthDate != "" {
+		birthDate = bolAnalysis.Fields.BirthDate
+	}
+
 	fields := DocumentFields{
 		DocumentType:   docType,
-		DocumentNumber: mergeDocNumber(mrzFields.DocumentNumber, visFields.DocumentNumber),
+		DocumentNumber: docNum,
 		FullName:       finalFull,
 		FirstName:      finalFirst,
 		LastName:       finalLast,
-		Nationality:    firstNonEmpty(mrzFields.Nationality, visFields.Nationality),
-		Gender:         firstNonEmpty(mrzFields.Gender, visFields.Gender),
-		BirthDate:      firstNonEmpty(mrzFields.BirthDate, visFields.BirthDate),
+		Nationality:    nationality,
+		Gender:         gender,
+		BirthDate:      birthDate,
 		Occupation:     visFields.Occupation,
 		OriginCity:     visFields.OriginCity,
 	}
@@ -182,16 +253,21 @@ func ParseDocumentText(rawText string) ParseResult {
 	conf := "PARCIAL"
 	if mrzDetected {
 		conf = "ALTA (MRZ Verificado)"
+	} else if bolAnalysis.IsBolivia && fields.FullName != "" && fields.DocumentNumber != "" {
+		conf = "ALTA (SEGIP Bolivia Verificado)"
 	} else if countNonEmpty(fields) >= 3 {
 		conf = "MEDIA-ALTA"
 	}
 
 	return ParseResult{
-		Service:     "sisaloja-ocr",
-		Engine:      "hybrid-mrz-segip",
-		Confidence:  conf,
-		DetectedMRZ: mrzDetected,
-		Fields:      fields,
+		Service:          "sisaloja-ocr",
+		Engine:           "hybrid-mrz-segip-bolivia",
+		Confidence:       conf,
+		DetectedMRZ:      mrzDetected,
+		IsBolivia:        bolAnalysis.IsBolivia,
+		BoliviaSubtype:   bolAnalysis.Subtype,
+		ExtractionMethod: bolAnalysis.ExtractionMethod,
+		Fields:           fields,
 	}
 }
 

@@ -121,3 +121,77 @@ func TestOCRMicroservice_NoisyColumnsAndSplitLastNames(t *testing.T) {
 	}
 }
 
+func TestOCRMicroservice_BoliviaMissingLabelsAndStructuralWindow(t *testing.T) {
+	app := NewApp()
+
+	// Caso real: Las etiquetas tenues "NOMBRES" y "APELLIDOS" no fueron leídas por el OCR,
+	// pero sí las líneas en negrita con el nombre y los apellidos del carnet boliviano.
+	payload := map[string]string{
+		"front_text": `
+			ESTADO PLURINACIONAL DE BOLIVIA
+			SERVICIO GENERAL DE IDENTIFICACION PERSONAL
+			CEDULA DE IDENTIDAD
+			N° 12450987 LP
+			MIJAEL
+			ROJAS MAMANI
+			14 DE MAYO DE 2003
+			FIRMA DEL TITULAR
+		`,
+	}
+	body, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/ocr/scan", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %v", resp.StatusCode)
+	}
+
+	var res parser.ParseResult
+	_ = json.NewDecoder(resp.Body).Decode(&res)
+
+	if !res.IsBolivia {
+		t.Fatalf("expected IsBolivia=true")
+	}
+	if res.Fields.FullName != "Mijael Rojas Mamani" {
+		t.Fatalf("expected FullName='Mijael Rojas Mamani', got '%s'", res.Fields.FullName)
+	}
+	if res.Fields.DocumentNumber != "12450987 LP" {
+		t.Fatalf("expected DocumentNumber='12450987 LP', got '%s'", res.Fields.DocumentNumber)
+	}
+	if res.Fields.BirthDate != "2003-05-14" {
+		t.Fatalf("expected BirthDate='2003-05-14', got '%s'", res.Fields.BirthDate)
+	}
+}
+
+func TestOCRMicroservice_BoliviaClassicCardAndDegradedIDBOL(t *testing.T) {
+	// 1. Carnet clásico boliviano donde la etiqueta "A:" se perdió pero el nombre está encima de FIRMA DEL TITULAR
+	resClassic := parser.ParseDocumentText(`
+		ESTADO PLURINACIONAL DE BOLIVIA
+		CEDULA DE IDENTIDAD
+		SERIE B  SECCION 1421
+		N° 6841209
+		JUAN CARLOS QUISPE CONDORI
+		FIRMA DEL TITULAR
+	`)
+	if resClassic.Fields.FullName != "Juan Carlos Quispe Condori" {
+		t.Fatalf("expected 'Juan Carlos Quispe Condori', got '%s'", resClassic.Fields.FullName)
+	}
+
+	// 2. Reverso MRZ IDBOL degradado donde el OCR leyó un solo '<' entre apellidos y nombre ("ROJAS<MAMANI<MIJAEL<<<<<<")
+	resMRZ := parser.ParseDocumentText(`
+		LUGAR DE NACIMIENTO: CERCADO - COCHABAMBA
+		OCUPACION: ESTUDIANTE
+		1DB0L9412833<<4<<<<<<<<<<<<<<<
+		0311208M3011205BOL<<<<<<<<<<<6
+		ROJAS<MAMANI<MIJAELKK<<<<<<<<<
+	`)
+	if resMRZ.Fields.FullName != "Mijael Rojas Mamani" {
+		t.Fatalf("expected 'Mijael Rojas Mamani' from degraded IDBOL MRZ, got '%s'", resMRZ.Fields.FullName)
+	}
+	if resMRZ.Fields.OriginCity != "Cochabamba" {
+		t.Fatalf("expected OriginCity='Cochabamba', got '%s'", resMRZ.Fields.OriginCity)
+	}
+}
+
+
