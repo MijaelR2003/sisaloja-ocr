@@ -1,0 +1,8 @@
+.git
+.gitignore
+.env
+.env.*
+sisaloja-ocr-server
+sisaloja-ocr
+*.log
+.DS_Store
