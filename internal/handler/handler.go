@@ -117,51 +117,67 @@ func (h *OCRHandler) ScanDocument(c *fiber.Ctx) error {
 		}
 	}
 
-	// 1. Si llegaron bytes de imagen y el servidor tiene Apple Vision Neural OCR (macOS) o Tesseract CLI,
-	// extraer el texto de alta precisión directamente en el servidor.
-	var visionFront, visionBack string
-	usedVision := false
-	if len(frontBytes) > 0 && ocr.HasVisionOCR() {
-		if txt, err := ocr.ExtractTextWithVisionOCR(frontBytes); err == nil && strings.TrimSpace(txt) != "" {
-			visionFront = txt
-			usedVision = true
-		}
-	} else if len(frontBytes) > 0 && ocr.HasTesseractCLI() {
-		if txt, err := ocr.ExtractTextWithTesseractCLI(frontBytes, h.TesseractLang); err == nil && strings.TrimSpace(txt) != "" {
-			frontText = txt + "\n" + frontText
+	// 1. Si llegaron bytes de imagen y el servidor tiene Apple Vision Neural OCR (macOS) o Tesseract CLI (Linux/Docker),
+	// extraer el texto en el servidor manteniendo separado el texto del motor del servidor respecto al enviado por el cliente.
+	var serverFront, serverBack string
+	serverEngine := ""
+	if len(frontBytes) > 0 {
+		if ocr.HasVisionOCR() {
+			if txt, err := ocr.ExtractTextWithVisionOCR(frontBytes); err == nil && strings.TrimSpace(txt) != "" {
+				serverFront = txt
+				serverEngine = "apple-vision-neural+segip-bolivia"
+			}
+		} else if ocr.HasTesseractCLI() {
+			if txt, err := ocr.ExtractTextWithTesseractCLI(frontBytes, h.TesseractLang); err == nil && strings.TrimSpace(txt) != "" {
+				serverFront = txt
+				serverEngine = "tesseract-cli+segip-bolivia"
+			}
 		}
 	}
 
-	if len(backBytes) > 0 && ocr.HasVisionOCR() {
-		if txt, err := ocr.ExtractTextWithVisionOCR(backBytes); err == nil && strings.TrimSpace(txt) != "" {
-			visionBack = txt
-			usedVision = true
-		}
-	} else if len(backBytes) > 0 && ocr.HasTesseractCLI() {
-		if txt, err := ocr.ExtractTextWithTesseractCLI(backBytes, h.TesseractLang); err == nil && strings.TrimSpace(txt) != "" {
-			backText = txt + "\n" + backText
+	if len(backBytes) > 0 {
+		if ocr.HasVisionOCR() {
+			if txt, err := ocr.ExtractTextWithVisionOCR(backBytes); err == nil && strings.TrimSpace(txt) != "" {
+				serverBack = txt
+				if serverEngine == "" {
+					serverEngine = "apple-vision-neural+segip-bolivia"
+				}
+			}
+		} else if ocr.HasTesseractCLI() {
+			if txt, err := ocr.ExtractTextWithTesseractCLI(backBytes, h.TesseractLang); err == nil && strings.TrimSpace(txt) != "" {
+				serverBack = txt
+				if serverEngine == "" {
+					serverEngine = "tesseract-cli+segip-bolivia"
+				}
+			}
 		}
 	}
 
 	// 2. Ejecutar el decodificador MRZ ICAO 9303 + Motor Especializado SEGIP Bolivia
 	var res parser.ParseResult
-	if usedVision {
-		// Analizar primero el texto limpio del motor neuronal Apple Vision sin ruido de Tesseract
-		res = parser.ParseAndMergeSides(visionFront, visionBack)
-		res.Engine = "apple-vision-neural+segip-bolivia"
-		res.RawText = strings.TrimSpace(visionFront + "\n" + visionBack)
+	if serverEngine != "" {
+		// Analizar primero el texto del motor del servidor sin mezclarlo directamente con texto del navegador
+		res = parser.ParseAndMergeSides(serverFront, serverBack)
+		res.Engine = serverEngine
+		res.RawText = strings.TrimSpace(strings.TrimSpace(serverFront) + "\n" + strings.TrimSpace(serverBack))
 
-		// Si el navegador también envió texto adicional (ej. de un recorte ROI), completar solo campos que falten
+		// Si el cliente también envió texto adicional (ej. ROI multi-zona de Tesseract.js), fusionar campos complementarios
 		if strings.TrimSpace(frontText) != "" || strings.TrimSpace(backText) != "" {
-			fallbackRes := parser.ParseAndMergeSides(frontText, backText)
-			res.Fields = parser.MergeFieldsWithMRZPriority(res.Fields, res.DetectedMRZ, fallbackRes.Fields, fallbackRes.DetectedMRZ)
-			if fallbackRes.DetectedMRZ {
+			clientRes := parser.ParseAndMergeSides(frontText, backText)
+			res.Fields = parser.MergeFieldsWithMRZPriority(res.Fields, res.DetectedMRZ, clientRes.Fields, clientRes.DetectedMRZ)
+			if clientRes.DetectedMRZ {
 				res.DetectedMRZ = true
+			}
+			if res.BoliviaSubtype == "" {
+				res.BoliviaSubtype = clientRes.BoliviaSubtype
+			}
+			if res.ExtractionMethod == "" {
+				res.ExtractionMethod = clientRes.ExtractionMethod
 			}
 		}
 	} else {
 		res = parser.ParseAndMergeSides(frontText, backText)
-		res.RawText = strings.TrimSpace(frontText + "\n" + backText)
+		res.RawText = strings.TrimSpace(strings.TrimSpace(frontText) + "\n" + strings.TrimSpace(backText))
 	}
 
 	// 3. Si hay GEMINI_API_KEY opcional configurada y llegaron imágenes, enriquecer campos vacíos
